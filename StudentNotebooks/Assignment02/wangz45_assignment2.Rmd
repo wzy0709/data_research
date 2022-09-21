@@ -1,0 +1,483 @@
+---
+title: "DAR F22 Project Fairness Auditor Notebook Template"
+author: "Zeyu Wang"
+date: "9/10/2022"
+output:
+  html_document:
+    toc: yes
+  pdf_document:
+    toc: yes
+subtitle: "Fairness Auditor"
+---
+
+## Weekly Work Summary	
+* RCS ID: wangz45
+* Project Name: ML fairness
+* Summary of work since last week 
+
+    Added lambda regularized parameter to the logistic regression model as known as Lasso regression. 
+    The lambda parameter is decided using cross validation.
+    Slightly improved the results.
+    Explored different kinds of fairness metrics.
+    Tested the model according to the fairness metrics.
+    The fairness of the model still needs to improve.
+
+* NEW: Summary of github issues added and worked 
+
+    Commited the updated notebook.
+    
+* Summary of github commits 
+
+    dar-wangz45
+    finished notebook
+    
+* List of presentations,  papers, or other outputs
+* List of references (if necessary) 
+* Indicate any use of group shared code base
+* Indicate which parts of your described work were done by you or as part of joint efforts
+
+## Personal Contribution	
+
+* Clearly defined, unique contribution(s) done by you: code, ideas, writing...
+* Include github issues you've addressed
+
+## Discussion of Primary Findings 	
+
+* Discuss primary findings: 
+
+    * What did you want to know? 
+    * How did you go about finding it? 
+    * What did you find?
+	
+* **Required:** Provide illustrating figures and/or tables
+     
+    * Embed your code in this notebook if possible.
+    * If not possible, screen shots are acceptable. 
+    * If your figures are "live," either include source code embedded in notebook or provide github location for their source scripts.
+    * If your contributions included things that are not done in an R-notebook, (e.g. researching, writing, and coding in Python), you still need to do this status notebook in R.  Describe what you did here and put any products that you created in github. If you are writing online documents (e.g. overleaf or google docs), you can include links to the documents in this notebook instead of actual text.
+  ****
+  
+## Evaluating Bias Mitigation Algorithms
+
+This notebook includes the steps to
+1) Process the data before training a Machine Learning model
+2) Split the data into train-test
+3) Train a Machine Learning model (without bias mitigation) -  BaselineModel
+4) Evaluate the utility and fairness metrics of BaselineModel
+5) Train a Machine Learning model with a bias mitigation algorithm (Reweighing) - ReweighingModel
+6) Evaluate the utility and fairness metrics of this ReweighingModel
+7) Compare the scores for the two models
+
+### Load required libraries
+
+We load the required libraries for this project.
+
+```{r setup, include=FALSE}
+options(warn=-1)
+# Set the default CRAN repository
+local({r <- getOption("repos")
+       r["CRAN"] <- "http://cran.r-project.org" 
+       options(repos=r)
+})
+
+# Set code chunk defaults
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load required packages; install if necessary
+# CAUTION: DO NOT interrupt R as it installs packages!!
+
+if (!require("ggplot2")) {
+  install.packages("ggplot2")
+  library(ggplot2)
+}
+
+if (!require("fairmodels")) {
+  install.packages("fairmodels")
+  library(fairmodels)
+}
+
+if (!require("DALEX")) {
+  install.packages("DALEX")
+  library(DALEX)
+}
+
+if (!require("e1071")) {
+  install.packages("e1071")
+  library(e1071)
+}
+
+if (!require("tidyverse")) {
+  install.packages("tidyverse")
+  library(tidyverse)
+}
+
+if (!require("mltools")) {
+  install.packages("mltools")
+  library(mltools)
+}
+
+if (!require("glmnet")) {
+  install.packages("glmnet")
+  library(glmnet)
+}
+
+if (!require("data.table")) {
+  install.packages("data.table")
+  library(data.table)
+}
+
+if (!require("fairness")) {
+  install.packages("fairness")
+  library(fairness)
+}
+
+if (!require("fairmodels")) {
+  install.packages("fairmodels")
+  library(fairmodels)
+}
+
+if (!require("mlr3measures")) {
+  install.packages("mlr3measures")
+  library(mlr3measures)
+}
+
+if (!require("caret")) {
+  install.packages("caret")
+  library(caret)
+}
+if (!require("doParallel")) {
+  install.packages("doParallel")
+  library(caret)
+}
+```
+
+### 1) Process data
+
+Load the required dataset file. The dataset is the Adult Income dataset. We are predicting whether the outcome variable `income`, having two classes: (a) >50K or (b) <=50K. We use the protected attribute as `gender`. It has two values: (a) Female and (b) Male.
+
+```{r}
+# Read data
+filename <- "../data_files/dataset.csv"
+df <- read.csv(filename)
+
+# Look at the top rows
+head(df)
+```
+The data can be processed to make it suitable for training Machine Learning models such as removing rows with missing values, removing repeated columns etc.
+
+```{r}
+# Convert marital-status to simpler categories
+# If marital.status is either never-married, divorced, separated, widowed or single, 
+# the assigned value is 0 else 1
+df$marital.status <- ifelse((df$marital.status == "Never-married") | 
+                                        (df$marital.status == "Divorced") |
+                                        (df$marital.status == "Separated") | 
+                                        (df$marital.status == "Widowed") |
+                                        (df$marital.status == "Single"), 0, 1)
+
+# Remove rows with missing values (denoted by ?)
+df[df == '?'] <- NA
+df <- na.omit(df)
+
+# Convert categorical columns to numerical and then change to integer type
+df$gender <- ifelse(df$gender == "Male", 1, 0)
+df$income <- ifelse(df$income == ">50K", 1, 0)
+
+# Drop extra columns not to be used for model training
+df <- subset(df, select = -c(`education`, `age`, `hours.per.week`, `fnlwgt`, 
+                       `capital.gain`, `capital.loss`, `native.country`))
+
+# One-hot encode categorical columns
+df$workclass <- as.factor(df$workclass)
+df$occupation <- as.factor(df$occupation)
+df$relationship <- as.factor(df$relationship)
+df$race <- as.factor(df$race)
+df <- one_hot(as.data.table(df))
+
+# Save processed data
+saved_filename <- "../data_files/processed_dataset.csv"
+write.csv(df, saved_filename, row.names = FALSE)
+```
+
+### 2) Split data into train-test
+
+We begin by splitting the data into train-test split.
+
+```{r}
+# Set seed for reproducibility
+set.seed(0)
+
+# Split data into train-test
+# 70% data to be used for training 
+# 30% data to be used for testing
+
+# Get indices
+training_size <- floor(0.7*nrow(df))
+train_ind <- sample(seq_len(nrow(df)), size = training_size)
+
+# Split data
+names(df) <- make.names(names(df))
+train.raw <- df[train_ind, ]
+test.raw <- df[-train_ind, ]
+
+# Scale train-test data
+# except for income and gender
+pp = preProcess(subset(train.raw, select = -c(`gender`, `income`)))
+train.scale <- predict(pp, subset(train.raw, select = -c(`gender`, `income`)))
+test.scale <- predict(pp, subset(test.raw, select = -c(`gender`, `income`)))
+
+# Attach income and gender to scaled data
+train.scale$gender <- train.raw$gender
+test.scale$gender <- test.raw$gender
+Xtrain <- train.scale
+Xtest <- test.scale
+train.scale$income <- train.raw$income
+test.scale$income <- test.raw$income
+```
+
+### 3) Train a ML model - BaselineModel
+
+Once the data is split, we train a Logistic Regression model on the training data. `income` is used as the outcome variable.
+
+```{r}
+# Train a Logistic Regression model
+baselineModel <- glm(income ~ ., data = train.scale, family = binomial)
+
+# Get prediction on test data
+baselineModel.prob <- predict(baselineModel, test.scale, type = 'response')
+baselineModel.pred <- ifelse(baselineModel.prob > 0.5, 1, 0)
+```
+
+### 4) Evaluate utility and fairness metrics for BaselineModel
+
+First, the utility is evaluated using Balanced Accuracy. Balanced Accuracy measures the accuracy for both classes of an outcome variable. We use the function `bacc()` to evaluate balanced accuracy.
+
+```{r}
+# Calculate Balanced Accuracy
+baselineModel.bal_acc <- bacc(as.factor(test.scale$income), as.factor(baselineModel.pred))
+```
+
+Next, the fairness is evaluated for the given model. The fairness is evaluated for Gender protected attribute with two classes: Male and Female. We calculate Equalized Odds. Link: https://kozodoi.me/r/fairness/packages/2020/05/01/fairness-tutorial.html
+
+```{r}
+# Create a copy of the dataset for fairness evaluation
+test2 <- test.scale
+test2$prob <- baselineModel.prob
+test2$income <- as.factor(test2$income)
+test2$gender <- as.factor(test2$gender)
+
+# Evaluate TPR difference
+# NOTE: In the library `fairness`, Equalized Odds is defined as separation which is 
+# the TPR difference only. This is not the same Equalized Odds calculated here.
+tpr_results <- equal_odds(data         = test2, 
+                     outcome      = 'income', 
+                     outcome_base = '0', 
+                     group        = 'gender',
+                     probs        = 'prob', 
+                     cutoff       = 0.5, 
+                     base         = '0')  
+tpr_diff <- tpr_results$Metric[1] - tpr_results$Metric[4]
+
+# Evaluate FPR difference
+fpr_results <- fpr_parity(data         = test2, 
+                     outcome      = 'income', 
+                     outcome_base = '0', 
+                     group        = 'gender',
+                     probs        = 'prob', 
+                     cutoff       = 0.5, 
+                     base         = '0')  
+fpr_diff <- fpr_results$Metric[1] - fpr_results$Metric[4]
+
+# Evaluate Equalized Odds (EO)
+# We define equalized odds as discussed in class
+baselineModel.eo <- max(abs(tpr_diff), abs(fpr_diff))
+```
+### 5) Train ML model with Reweighing
+
+We train a Logsitic Regression model similar to step 3 while also applying Reweighing bias mitigation algorithm.
+
+```{r}
+# Apply reweighing before model training
+# Get weights during Reweighing
+reweighing_weights <- reweight(train.scale$gender, train.scale$income)
+
+# Train a Logistic Regression model
+reweighingModel <- glm(income ~ ., data = train.scale, family = binomial, weights = reweighing_weights)
+
+# Get prediction on test data
+reweighingModel.prob <- predict(reweighingModel, test.scale, type = 'response')
+reweighingModel.pred <- ifelse(reweighingModel.prob > 0.5, 1, 0)
+```
+### 6) Evaluate utility and fairness metrics for ReweighingModel
+
+Similar to step 4, evaluate balanced accuracy and equalized odds.
+
+```{r}
+# Calculate Balanced Accuracy
+reweighingModel.bal_acc <- bacc(as.factor(test.scale$income), as.factor(reweighingModel.pred))
+
+# Create a copy of the dataset for fairness evaluation
+test3 <- test.scale
+test3$prob <- reweighingModel.prob
+test3$income <- as.factor(test3$income)
+test3$gender <- as.factor(test3$gender)
+
+# Evaluate TPR difference
+tpr_results <- equal_odds(data         = test3, 
+                     outcome      = 'income', 
+                     outcome_base = '0', 
+                     group        = 'gender',
+                     probs        = 'prob', 
+                     cutoff       = 0.5, 
+                     base         = '0')  
+tpr_diff <- tpr_results$Metric[1] - tpr_results$Metric[4]
+
+# Evaluate FPR difference
+fpr_results <- fpr_parity(data         = test3, 
+                     outcome      = 'income', 
+                     outcome_base = '0', 
+                     group        = 'gender',
+                     probs        = 'prob', 
+                     cutoff       = 0.5, 
+                     base         = '0')  
+fpr_diff <- fpr_results$Metric[1] - fpr_results$Metric[4]
+
+# Evaluate Equalized Odds (EO)
+reweighingModel.eo <- max(abs(tpr_diff), abs(fpr_diff))
+```
+### 7) Compare the scores for the two models
+
+We compare the Balanced Accuracy and Equalized Odds scores.
+
+```{r}
+print("# Balanced Accuracy scores")
+print(paste0("Baseline model: ", baselineModel.bal_acc))
+print(paste0("Reweighing model: ", reweighingModel.bal_acc))
+
+print("# Equalized Odds scores")
+print(paste0("Baseline model: ", baselineModel.eo))
+print(paste0("Reweighing model: ", reweighingModel.eo))
+```
+*Finding:* As a higher Balanced Accuracy score is better, Baseline model has a better performance than the Reweighing. On the other hand, a lower Equalized Odds score is better, Reweighing model is better. A model with Equalized Odds less than or equal to 0.1 is considered to be fair. So, Reweighing model is very close to being fair.
+
+## Own Part
+### 1) Train another ML model
+
+TODO: Try to applying another classification Machine Learning model of your choice. Evaluate Balanced Accuracy and Equalized Odds on the generated model.
+
+```{r}
+# 1. Train ML model here on train data
+# Lasso regression with CV
+registerDoParallel(detectCores())
+cv <- cv.glmnet(as.matrix(Xtrain), as.matrix(train.scale$income), alpha = 1, family = "binomial", weights=reweighing_weights,parallel = TRUE)
+LassoModel <- glmnet(as.matrix(Xtrain), as.matrix(train.scale$income), alpha = 1, family = "binomial", weights=reweighing_weights, lambda = cv$lambda.min)
+```
+```{r}
+# 2. Get predictions on test data
+LassoModel.prob <- predict(LassoModel, as.matrix(Xtest), type = 'response')
+LassoModel.pred <- ifelse(LassoModel.prob > 0.5, 1, 0)
+```
+
+
+```{r}
+# 3. Evaluate balanced accuracy
+LassoModel.bal_acc <- bacc(as.factor(test.scale$income), as.factor(LassoModel.pred))
+# 4. Evaluate equalized odds
+# Create a copy of the dataset for fairness evaluation
+test4 <- test.scale
+test4$prob <- LassoModel.prob
+test4$income <- as.factor(test4$income)
+test4$gender <- as.factor(test4$gender)
+
+# Evaluate TPR difference
+tpr_results <- equal_odds(data         = test4, 
+                     outcome      = 'income', 
+                     outcome_base = '0', 
+                     group        = 'gender',
+                     probs        = 'prob', 
+                     cutoff       = 0.5, 
+                     base         = '0')  
+tpr_diff <- tpr_results$Metric[1] - tpr_results$Metric[4]
+
+# Evaluate FPR difference
+fpr_results <- fpr_parity(data         = test4, 
+                     outcome      = 'income', 
+                     outcome_base = '0', 
+                     group        = 'gender',
+                     probs        = 'prob', 
+                     cutoff       = 0.5, 
+                     base         = '0')  
+
+# Evaluate Equalized Odds (EO)
+LassoModel.eo <- max(abs(tpr_diff), abs(fpr_diff))
+```
+
+```{r}
+# 5. Compare results with baselineModel and reweighingModel
+print("# Balanced Accuracy scores")
+print(paste0("Baseline model: ", baselineModel.bal_acc))
+print(paste0("Reweighing model: ", reweighingModel.bal_acc))
+print(paste0("Lasso regression model: ", LassoModel.bal_acc))
+
+print("# Equalized Odds scores")
+print(paste0("Baseline model: ", baselineModel.eo))
+print(paste0("Reweighing model: ", reweighingModel.eo))
+print(paste0("Lasso regression model: ", LassoModel.eo))
+```
+
+```{r}
+#TODO: https://www.r-bloggers.com/2016/03/improve-svm-tuning-through-parallelism/
+#exp(seq(log(0.001), log(100), 1))
+```
+
+### 2) Evaluate other fairness metrics
+
+TODO: Identify two other fairness metrics apart from Equalized Odds and evaluate them on two ML models: BaselineModel and ReweighingModel. 
+
+Here's resources for alternate metrics:
+
+* https://kozodoi.me/r/fairness/packages/2020/05/01/fairness-tutorial.html
+
+* https://github.com/Trusted-AI/AIF360/tree/master/aif360/aif360-r
+
+
+```{r}
+# 1. List the name of the two fairness metrics
+#https://arxiv.org/pdf/2106.00467.pdf
+#Some examples like
+#Equal Accuracy
+#Equal Opportunity
+#Predicative Equity
+#Predicative parity
+#Statistical parity
+
+# 2. Measure them on baselineModel and reweighingModel
+#https://www.r-bloggers.com/2020/07/fairmodels-lets-fight-with-biased-machine-learning-models-part-1%E2%80%8A-%E2%80%8Adetection/
+explainer_base <- DALEX::explain(baselineModel, data = Xtest, y = test.scale$income,label = "baseline", verbose = F)
+explainer_reweight <- DALEX::explain(reweighingModel, data = Xtest, y = test.scale$income,label="reweighing", verbose = F)
+explainer_Lasso <- DALEX::explain(LassoModel, data = Xtest, y = test.scale$income,label="Lasso", verbose = F)
+fobject <- fairness_check(explainer_base,explainer_reweight,explainer_Lasso,
+                          protected = Xtest$gender,
+                          privileged = 1, verbose = F)
+```
+```{r}
+# 3. Compare the scores and explain what you find
+print(fobject)
+fobject$parity_loss_metric_data
+plot(fobject)
+```
+We could find from the graph above, reweighted model did far way better job than baseline model in dealing with bias except predictive one. Although all of the models could not pass all of the metrics and further improvement is needed.
+
+### 3) List fairness libraries
+
+https://github.com/Trusted-AI/AIF360/tree/master/aif360/aif360-r
+air360 not only provided fairness metrics but also bias mitigation algorithms.
+
+https://modeloriented.github.io/fairmodels/index.html
+fairmodels provided fairness check using different metrics and nice plots.
+
+fairness packages could also check the fairness metrics
+
+https://github.com/ModelOriented/DALEX
+DALEX could be used to explain the output of the model(post processing)
+### 4) Be prepared to discuss your findings in class (2-3 minutes)

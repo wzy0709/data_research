@@ -1,0 +1,344 @@
+---
+title: "Pre-processing mitigation algorithms and group fairness metrics"
+author: "Zeyu Wang"
+date: "9/19/2022"
+output:
+  html_document:
+    toc: yes
+  pdf_document:
+    toc: yes
+subtitle: "Fairness Auditor"
+---
+
+## Weekly Work Summary	
+* RCS ID: wangz45
+* Project Name: ML fairness
+* Summary of work since last week 
+
+    Added lambda regularized parameter to the logistic regression model as known as Lasso regression. 
+    The lambda parameter is decided using cross validation.
+    Slightly improved the results.
+    Explored different kinds of fairness metrics.
+    Tested the model according to the fairness metrics.
+    The fairness of the model still needs to improve.
+
+* NEW: Summary of github issues added and worked 
+
+    Explored pre-processing bias mitigation algorithms and group fairness metrics.
+    
+* Summary of github commits 
+
+    dar-wangz45
+    finished notebook
+    
+* List of presentations,  papers, or other outputs
+* List of references (if necessary) 
+* Indicate any use of group shared code base
+* Indicate which parts of your described work were done by you or as part of joint efforts
+
+## Personal Contribution	
+
+* Clearly defined, unique contribution(s) done by you: code, ideas, writing...
+* Include github issues you've addressed
+
+## Discussion of Primary Findings 	
+
+* Discuss primary findings: 
+
+    * What did you want to know? 
+    * How did you go about finding it? 
+    * What did you find?
+  
+## Continue To Explore Bias Mitigation Algorithms
+
+This notebook includes the steps to
+1) Process the data before training a Machine Learning model
+2) Split the data into train-test
+3) Train a Machine Learning model (without bias mitigation) -  BaselineModel
+4) Evaluate the utility and fairness metrics of BaselineModel
+5) Train a Machine Learning model with a bias mitigation algorithm (Reweighing) - ReweighingModel
+6) Evaluate the utility and fairness metrics of this ReweighingModel
+7) Compare the scores for the two models
+
+### Load required libraries
+
+We load the required libraries for this project.
+
+```{r setup, include=FALSE}
+options(warn=-1)
+# Set the default CRAN repository
+local({r <- getOption("repos")
+       r["CRAN"] <- "http://cran.r-project.org" 
+       options(repos=r)
+})
+
+# Set code chunk defaults
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load required packages; install if necessary
+# CAUTION: DO NOT interrupt R as it installs packages!!
+
+if (!require("ggplot2")) {
+  install.packages("ggplot2")
+  library(ggplot2)
+}
+if (!require("magick")) {
+  install.packages("magick")
+  library(magick)
+}
+if (!require("MASS")) {
+  install.packages("MASS")
+  library(MASS)
+}
+if (!require("caret")) {
+  install.packages("caret")
+  library(caret)
+}
+if (!require("DALEX")) {
+  install.packages("DALEX")
+  library(DALEX)
+}
+
+if (!require("tidyverse")) {
+  install.packages("tidyverse")
+  library(tidyverse)
+}
+
+if (!require("data.table")) {
+  install.packages("data.table")
+  library(data.table)
+}
+
+if (!require("fairness")) {
+  install.packages("fairness")
+  library(fairness)
+}
+
+if (!require("fairmodels")) {
+  install.packages("fairmodels")
+  library(fairmodels)
+}
+
+if (!require("mlr3measures")) {
+  install.packages("mlr3measures")
+  library(mlr3measures)
+}
+
+if (!require("ggrepel")) {
+  install.packages("ggrepel")
+  library(ggrepel)
+}
+
+```
+
+### 1) Process data
+
+We still used the processed data in assignment 2, split and scale the data as usual. 
+
+```{r}
+# Set seed for reproducibility
+set.seed(0)
+# read processed data
+df <- read.csv("../../data_files/processed_dataset.csv")
+# Split data into train-test
+# 70% data to be used for training 
+# 30% data to be used for testing
+
+# Get indices
+training_size <- floor(0.7*nrow(df))
+train_ind <- sample(seq_len(nrow(df)), size = training_size)
+
+# Split data
+names(df) <- make.names(names(df))
+train.raw <- df[train_ind, ]
+test.raw <- df[-train_ind, ]
+
+# Scale train-test data
+# except for income and gender
+pp = preProcess(subset(train.raw, select = -c(`gender`, `income`)))
+train.scale <- predict(pp, subset(train.raw, select = -c(`gender`, `income`)))
+test.scale <- predict(pp, subset(test.raw, select = -c(`gender`, `income`)))
+
+# Attach income and gender to scaled data
+Xtrain <- train.scale
+Xtest <- test.scale
+protectrain <- train.raw$gender
+protectest <- test.raw$gender
+train.scale$income <- as.factor(train.raw$income)
+test.scale$income <-as.factor(test.raw$income)
+```
+
+### 2) Pre-processing Bias Mitigation techniques
+In this assignment, we are mainly exploring pre-processing bias mitigation techniques. We will explore post-processing one in the following assignments very soon. The tutorials could be found in https://modeloriented.github.io/fairmodels/articles/Advanced_tutorial.html#pre-processing-techniques-1.
+
+#### 1) LDA baseline
+
+In assignment 2, Youjin achieved the best accuracy using LDA, so we utilized LDA to test mitigation bias algorithms in this assignment although additional models should be explored in the future.(Note: Here we deleted protected columns "gender" from the dataset since we found that deleting this column will result better balanced accuracy(0.7319788) and equalized odds(0.156129) using baseline LDA compared with baseline LM).
+```{r}
+# train the baseline LDA model
+LDA_baseline <- caret::train(income ~ .,
+                 data = train.scale,
+                 method = "lda",
+                 metric = "Accuracy")
+```
+Next, let us create the explainer of baseline model in order to analyze later.
+```{r}
+# use dalex explain
+LDA_baseline_explainer <- DALEX::explain(LDA_baseline,
+                         data = Xtest,
+                         y = as.numeric(test.scale$income)-1, verbose = F, label = "baseline")
+```
+
+#### 2) Distribution changing
+Disparate impact remover is a pre-processing bias mitigation method. It removes bias hidden in
+numeric columns in data. It changes distribution of ordinal features of data with regard to earth
+mover distance. It works best if among subgroups there is similar number of observations. This method was implemented based on Feldman, Friedler, Moeller, Scheidegger, Venkatasubramanian 2015 https://arxiv.org/pdf/1412.3756.pdf.
+
+However, the use of the techniques is somewhat limited since it could only apply to numerical, ordinal values so we could only apply at the only attribute educational.num since other numerical ordinal values such as age have been deleted by us.
+
+Here we just create the fixed data and do the model learning same as baseline LDA and create the explainer to analyze later.
+```{r}
+# get fixed data
+data_fixed <- disparate_impact_remover(data = train.scale, protected = as.factor(protectrain), 
+                            features_to_transform = c("educational.num"))
+# train the baseline LDA model
+LDA_distri <- caret::train(income ~ .,
+                 data = data_fixed,
+                 method = "lda",
+                 metric = "Accuracy")
+# create dalex explain
+LDA_distri_explainer <- DALEX::explain(LDA_distri,
+                         data = Xtest,
+                         y = as.numeric(test.scale$income)-1, verbose = F, label = "distribution")
+```
+#### 3) Reweighting
+Reweighting has been discussed in assignment2, but we failed to apply it on LDA. It should be explored further.
+
+In fact reweighting could potentially worsen the overall performance in other fairness
+metrics. This affects also model’s performance metrics (accuracy).
+
+#### 4) Resampling
+This method was implemented based on Kamiran, Calders 2011 https://link.springer.com/
+content/pdf/10.1007/s10115-011-0463-8.pdf
+
+This method derives from reweighting the data but instead of weights it chooses observations from data the outcome of metrics. There are 2 types of resampling:
+
+1. uniform - takes random observation from particular subgroup (in particular case - y == 1 or y == 0)
+
+2. preferential - takes/omits observations either close to cutoff or as far from cutoff as possible. It needs probabilities (probs)
+
+Since resampling will discard some of the datasets, it may affect accuracy of training.
+
+We first create uniform resampling. Don't hurry, we will analyze later!
+```{r}
+# we create uniform index we chose.
+uniform_indexes  <- fairmodels::resample(protected = as.factor(protectrain),
+                                 y = as.numeric(train.scale$income)-1)
+# train the uniform resampling LDA model
+LDA_uniform <- caret::train(income ~ .,
+                 data = train.scale[uniform_indexes,],
+                 method = "lda",
+                 metric = "Accuracy")
+# create dalex explain
+LDA_uniform_explainer <- DALEX::explain(LDA_uniform,
+                         data = Xtest,
+                         y = as.numeric(test.scale$income)-1, verbose = F, label = "uniform")
+```
+Then we use logistic regression to create probability and do the preferential resampling to create the explainer.
+```{r}
+# use logistic regression to create probability
+probs <- glm(income ~., data = train.scale, family = binomial())$fitted.values
+# we create uniform index we chose.
+preferential_indexes <- fairmodels::resample(protected = as.factor(protectrain),
+                                 y = as.numeric(train.scale$income)-1,
+                                 type = "preferential",
+                                 probs = probs)
+# train the uniform resampling LDA model
+LDA_prefer <- caret::train(income ~ .,
+                 data = train.scale[preferential_indexes,],
+                 method = "lda",
+                 metric = "Accuracy")
+# create dalex explain
+LDA_prefer_explainer <- DALEX::explain(LDA_prefer,
+                         data = Xtest,
+                         y = as.numeric(test.scale$income)-1, verbose = F, label = "preferential")
+```
+### 3) Outcomes
+To analyze the outcomes of our models. We first need to decide which fairness metrics to use. We referenced IBM AI Fairnes 360 sourceshttp://aif360.mybluemix.net/resources#guidance in this research.
+
+There are two fairness classification in general:
+
+1) Group Fairness-partitions a population into groups defined by protected attributes and seeks for some statistical measure to be equal across groups
+
+2) Individual Fairness-seeks for similar individuals to be treated similarly.
+
+In this notebook, we will mainly analyze on group fairness. Individual fairness may be analyzed in the future.
+
+#### 1) Group Fairness
+There are two opposing worldviews on group fairness: we’re all equal (WAE) and what you see is what you get (WYSIWYG) according to IBM aif360.
+
+WAE believes that all groups have similar abilities with respect to the task, so the demographic parity metrics should be used
+
+WYSIWYG believes that the observations reflect ability with respect to the task, so the equality of odds metrics should be used.
+
+To decide the use of the metrics, Aequitas also provided a very nice decision tree.http://aequitas.dssg.io/static/images/metrictree.png
+```{r}
+img <- magick::image_read('http://aequitas.dssg.io/static/images/metrictree.png')
+plot(img)
+```
+The parity loss is calculated like this:
+```{r}
+img <- magick::image_read('https://raw.githubusercontent.com/ModelOriented/fairmodels/master/man/figures/formulas/parity_loss.png')
+plot(img)
+```
+Where i denotes the membership to unique subgroup from protected variable. Unprivileged subgroups are represented by small letters and privileged by simply "privileged".
+
+Some fairness metrics like Equalized odds are satisfied if parity loss in both True Positive Rate(TPR) and False Positive Rate(FPR) is low. 
+
+Next, we start to do fairness check on four of our explainers. The fairness check will test 4 of the 6 fairness metrics listed above including accuracy equity. The lowest acceptable ratio of metrics between unprivileged and privileged subgroups is the default value 0.8. Which means women should get credit at rate at least 80% of that of men.
+```{r}
+
+fobject <- fairness_check(LDA_baseline_explainer, LDA_distri_explainer, LDA_uniform_explainer, LDA_prefer_explainer,
+                      protected = protectest, 
+                      privileged = 1,
+                     verbose = FALSE) 
+fobject
+```
+We could see that though all the models only passed 2/5 tests, the total loss is different. All three of the pre-processing algorithms achived better results than baseline model and total loss of resampling model is much better than. The total loss of uniform resampling is best in our case, and it is also better than the reweighing algorithm applying on (regularized) logistic regression(total loss=1.24. For more details, please refer to assignment2).
+
+Next, let us dig deeper in these metrics. If bars reach red field on the left it means that there is bias towards certain unprivileged subgroup. If they reach one on the right it means bias towards privileged subgroups.
+
+##### 1) Demographic Parity
+Statistical Parity(STP) - Also know as equal parity, we need to select equal number of people in each group. We could see from the graph below, both resampling algorithms are better in this task. Preferential resampling is the only canditate passed this task. However, we will see that it may also affect other metrics significantly.
+
+##### 2) Error Parity
+Accuracy equality ratio(ACC parity)- we want to achieve equal accuracy across groups. All of the models could achieved the goal. However, resampling model is slightly better in this task, we guess it may be beacuse there are some tradeoffs in accuracy(we will show accuracy very soon).
+
+Predictive Parity(PPV) - Also known as False Discovery Rate Parity or Precision Parity. It is considered when the interventions are punitive and with small percent of the group. Thus it may not apply to our cases very well, but we can see that uniform resampling is far way better than other models and is the only one that passed the test. Preferential is relatively better but is biased toward the protected subgroup.
+
+Equality of Odds - Equalized Odds are satisfied if parity loss in both True Positive Rate(TPR) and False Positive Rate(FPR) is low.
+
+  True Positive Rate(TPR) - equivalent to False Negative Rate(FNR) aka Equal Opportunity. The interventions are assitive. Baseline and distribution models in this case is slightly better but is learning towards privileged subgroup.
+  
+  False Positive Rate(FPR) - equivalent to True Negative Rate(TNR) aka Predictive Equality. The interventions are punitive. In this case, baseline and distribution models are far way worse. Uniform resampling model is the best and the only one that passed the test.
+  
+  Combining TPR and FPR, we can see that uniform resampling model is the best in this task. Preferential is also ok but is leaning towards the protected subgroup too much.
+  
+```{r}
+plot(fobject)
+```
+##### 3) Conclusion
+Overall, there is no perfect mitigation method. The choice of mitigation methods is decided case by case. The WAE and WYSIWYG views may result in different use of mitigation methods. In this example, WAE view should use preferential resampling algorithm and WYSIWYG view should use uniform resampling algorithm. 
+  
+##### 4) Accuracy Trade Off
+Last, let us check the accuracy trade off using bias mitigation. Since we used WYSIWYG view(equalized odds) in assignment2, let us test WAE view(PPV) this time.
+```{r}
+paf <- fairmodels::performance_and_fairness(fobject, fairness_metric = "PPV",
+                                 performance_metric = "accuracy")
+plot(paf)
+```
+
+So we see from the graph, applying WAE view(PPV) in our example, the tradeoff exists and should always be taken into account. However, the decrease in accuracy in fact is not so significant, so it is very wise to choose the preferential resampling bias mitigation algorithm if WAE view holds.
+
+
+
